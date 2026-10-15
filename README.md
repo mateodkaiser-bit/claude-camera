@@ -30,7 +30,7 @@ pasted phone photo), and long jobs run in the background and only report what ma
 In Claude Code:
 
 ```text
-/plugin marketplace add <github-user>/claude-camera
+/plugin marketplace add mateodkaiser-bit/claude-camera
 /plugin install claude-camera@claude-camera
 ```
 

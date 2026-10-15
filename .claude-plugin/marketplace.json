@@ -1,0 +1,16 @@
+{
+  "name": "claude-camera",
+  "owner": {
+    "name": "Mateo Kaiser"
+  },
+  "plugins": [
+    {
+      "name": "claude-camera",
+      "source": "./",
+      "description": "Camera skill for prototyping and design work (macOS + iPhone Continuity Camera)."
+    }
+  ],
+  "metadata": {
+    "description": "Camera tools for Claude Code: see your workbench, document builds, film demos, watch prints."
+  }
+}

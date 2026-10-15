@@ -1,0 +1,8 @@
+{
+  "name": "claude-camera",
+  "description": "Let Claude see your workbench through an iPhone (Continuity Camera) or the Mac camera: token-cheap snapshots, change watching, timed captures, 3D-print monitoring, build-step documentation, demo clips and timelapses. Built for industrial designers and makers. macOS only.",
+  "version": "0.1.0",
+  "author": { "name": "Mateo Kaiser" },
+  "license": "MIT",
+  "keywords": ["camera", "continuity-camera", "prototyping", "industrial-design", "3d-printing", "timelapse", "documentation"]
+}

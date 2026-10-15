@@ -49,7 +49,27 @@ def duration(s):
 
 
 def human(sec):
-    return f"{sec / 3600:g} h" if sec >= 3600 and sec % 1800 == 0 else f"{sec / 60:g} min" if sec >= 60 else f"{sec:g} s"
+    return f"{sec / 3600:g} h" if sec >= 3600 and sec % 1800 == 0 else f"{round(sec / 60, 1):g} min" if sec >= 60 else f"{round(sec, 1):g} s"
+
+
+def keep_awake(what):
+    """Long jobs: stop the Mac idle-sleeping while this process lives (15 Oct: the Mac slept ~20 min
+    mid-monitor and every capture stopped). Lid-closed sleep on battery can't be prevented: warn."""
+    try:
+        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+        batt = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True).stdout
+        if "Battery Power" in batt:
+            print(f"NOTE: the Mac is on battery. Keep the lid OPEN and plug it in for the whole {what}: "
+                  "closing the lid on battery puts it to sleep and stops every capture.", flush=True)
+    except OSError:
+        pass
+
+
+def sleep_gap(t_expected, every, k):
+    """If this round started much later than scheduled, the Mac was asleep: say so in the log."""
+    late = time.time() - t_expected
+    if late > max(60, every * 0.5):
+        print(f"[{ts()}] NOTE: round {k} is {human(late)} late: the Mac was probably asleep.", flush=True)
 
 
 def ts():
@@ -333,6 +353,7 @@ def cmd_timelapse(args):
     out = outdir(args)
     end, k, base = time.time() + args.for_, 0, args.label or "timelapse"
     print(f"timelapse every {human(args.every)} for {human(args.for_)} -> {out}", flush=True)
+    keep_awake("timelapse")
     while time.time() < end:
         t0, k = time.time(), k + 1
         path = out / f"{base}-{k:03d}-{ts()}.jpg"
@@ -380,6 +401,7 @@ def cmd_watch(args):
     pre = ",".join([f"trim=start={warm_s},setpts=PTS-STARTPTS"] + crop_filter(args.crop) + [f"fps=1/{args.every}"])
     fc = (f"[0:v]{pre},split[a][b];[a]scale={args.width}:-2[big];"
           f"[b]scale=64:48,format=gray[small]")
+    keep_awake("watch")
     proc, errlog, pidf = ff_start(["-hide_banner", "-loglevel", "error", "-y", *input_args(args, device),
                                    "-filter_complex", fc,
                                    "-map", "[big]", "-q:v", "3", str(work / "b%06d.jpg"),

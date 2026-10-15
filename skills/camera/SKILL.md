@@ -124,12 +124,19 @@ never enter the main context.
    pixels visible right now**. They skip blurry frames and save a native-resolution crop. Mid-print,
    the head may never fully clear (60–75% visible is normal); for a clear plate, shoot after the print
    ends. Assumes a **dark print on a light bed**; light-on-dark isn't built yet.
+   **Large flat parts** (first-layer plates) fill the 25 px contrast window, so detection also accepts
+   any pixel darker than 70. With a close phone they can merge with rod smears into one big blob;
+   selecting that blob still works for monitoring (the crop covers the parts), it's just a looser crop.
 
-**It adapts to a moved phone on its own.** Each round aligns its first 3 s with the saved view. A
-**bump** (best-match error ≤ 22) is followed automatically (`view shifted +dx,+dy px`). A **re-aim**
-(error > 22) gives `CAMERA MOVED`: `monitor` re-runs `locate`, exits with `NEEDS CONFIRM`, and the
-job ending notifies you; Read the locate image, run `print use`, and restart. Calibration on recordings:
-unmoved 15.8, bumped-then-aligned 15.9, different scene 28.9 (the moving head alone adds ~15).
+**It adapts to a moved phone on its own,** conservatively. Each round compares its first 3 s with
+the saved view using a *trimmed* match error (it ignores the 40% of pixels that differ most, wherever
+the head is). It **follows a shift** only if the match improves by ≥ 4 and the shift is ≤ 60 px, because
+a wrong shift is worse than none. A high error alone only marks the round *suspect*: **"CAMERA MOVED"
+needs the print to be missing too** (< 15% visible). Then `monitor` re-runs `locate`, exits with
+`NEEDS CONFIRM`, and the job ending notifies you; Read the locate image, run `print use`, and restart.
+Calibration (15 Oct): recordings unmoved 3.2, bumped and aligned 4.6 (gain 4.3), different scene 12.0;
+a live close-up head-heavy view, unmoved, scored 12.5 and offered a bogus +88,−64 shift (gain 3.7, rejected).
+The first plain-mean version raised a false "moved" on the live close-up view, hence these guards.
 
 ## Reliability notes (verified 2026-10-15)
 
@@ -148,6 +155,11 @@ unmoved 15.8, bumped-then-aligned 15.9, different scene 28.9 (the moving head al
   first runs `pkill -9 -f cam-shot-`. Killing `open` never stops the ffmpeg inside ClaudeCam.
 - **Blur and freezes**: autofocus hunting once produced a fully blurred "best" frame. Shots skip frames
   under 60% of the round's sharpest and print `WARNING: BLURRY` / `WARNING: stream FROZE`.
+- **The Mac must stay awake.** On 15 Oct the Mac slept ~20 min mid-monitor (lid closed, on battery)
+  and every capture stopped, while the phone dropped off the camera list. `timelapse`, `watch` and
+  `print monitor` now run `caffeinate -i -w <pid>` (no idle sleep while the job lives), print a NOTE when
+  on battery, and log `round N is X late: the Mac was probably asleep`. Lid-closed sleep on battery
+  can't be blocked: ask the user to keep the lid open and the charger in for long jobs.
 - **Locked/asleep is required** (Continuity streams only from a locked phone). Waking it after idle is
   slower on battery or in Low Power Mode, so ask for the charger. A **moved** phone is the real risk:
   ask the user to check the view through `snap`, not by picking the phone up.

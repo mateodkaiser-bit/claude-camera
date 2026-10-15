@@ -111,7 +111,9 @@ def components(mask):
 
 def find_candidates(med):
     lm = local_mean(med, 12)
-    dark = [m < 140 and m < l - 30 for m, l in zip(med, lm)]
+    # local contrast finds small parts; the absolute test finds LARGE solid parts (first-layer plates),
+    # which fill the 25 px window and so never look darker than their own neighbourhood (15 Oct)
+    dark = [(m < 140 and m < l - 30) or m < 70 for m, l in zip(med, lm)]
     # opening (erode once, dilate once): removes 1-2 px specks/edges; belts are handled by the
     # thickness test below, which works at any angle (a bbox-aspect test misses diagonal belts)
     core = morph(morph(dark, "erode"), "dilate")
@@ -154,7 +156,12 @@ def _err(a, b, w, h, dx, dy):
     pa = [a[y * w + x] for y in ys for x in xs]
     pb = [b[(y + dy) * w + x + dx] for y in ys for x in xs]
     ma, mb = sum(pa) / len(pa), sum(pb) / len(pb)
-    return sum(abs((u - ma) - (v - mb)) for u, v in zip(pa, pb)) / len(pa)
+    # Trimmed: drop the 40% of pixels that differ most (wherever the head/rods happen to be). A close
+    # phone sees the head over half the frame, and the plain mean called that a "move" (15 Oct, 25.9).
+    # A real re-aim changes nearly every pixel, so it still scores high.
+    d = sorted(abs((u - ma) - (v - mb)) for u, v in zip(pa, pb))
+    keep = d[:max(1, int(len(d) * 0.6))]
+    return sum(keep) / len(keep)
 
 
 def estimate_shift(ref, cur):
@@ -175,9 +182,12 @@ def shift_img(img, dx, dy):
     return [img[min(SH - 1, max(0, y - dy)) * SW + min(SW - 1, max(0, x - dx))] for y in range(SH) for x in range(SW)]
 
 
-# Mean grey error after the best alignment, calibrated on recordings 15 Oct: unmoved 15.8 (the moving
-# head alone adds ~15), bumped 60x36 px then aligned 15.9, a different scene 28.9.
-SHIFT_BIG = 22    # above = different view (rotated / re-aimed / new position): re-locate + confirm
+# Trimmed grey error (best 60% of pixels), calibrated 15 Oct. Recordings: unmoved 3.2, bumped and aligned
+# 4.6 (improvement 4.3), different scene 12.0. Live close-up view, head-heavy, unmoved: 12.5, and the search
+# proposed a BOGUS shift (+88,-64) improving only 3.7. Hence two guards:
+SHIFT_SUSPECT = 9   # above = maybe re-aimed; only "moved" if the print is ALSO not visible this round
+SHIFT_GAIN = 4      # follow a shift only if it improves the match this much...
+SHIFT_MAX = 60      # ...and is at most this many px (320x240 scale): a wrong shift is worse than none
 
 
 def cell(x, y):
@@ -281,7 +291,7 @@ def cmd_shot(args):
     proc, err, pidf = stream(args, device, work)
     print(f"waiting up to {args.max_wait:.0f} s for the head to clear the print...", file=sys.stderr, flush=True)
     best, prev, n, glob_match, max_sharp, frozen = None, None, 0, [], 0.0, 0
-    warm, aligned, shift_note, moved_big = [], False, "", False
+    warm, aligned, shift_note, moved_big, suspect = [], False, "", False, False
     # sharpness = mean neighbour-pixel difference in the print region. Autofocus hunting gave a
     # completely blurred "best" frame on 15 Oct, because visibility alone can't see blur.
     def sharpness(img):
@@ -298,10 +308,10 @@ def cmd_shot(args):
                 aligned = True
                 cur = [sorted(f[i] for f in warm)[3] for i in range(SW * SH)]
                 dx, dy, e0, e = estimate_shift(med, cur)
-                if e > SHIFT_BIG:
-                    moved_big, shift_note = True, f"view changed (best match error {e}, unshifted {e0})"
-                    break
-                if (dx, dy) != (0, 0) and e0 - e >= 2:
+                suspect = e > SHIFT_SUSPECT and e0 > SHIFT_SUSPECT
+                if suspect:
+                    shift_note = f"view looks different (match error {e0}); checking the print is still there"
+                if (dx, dy) != (0, 0) and e0 - e >= SHIFT_GAIN and max(abs(dx), abs(dy)) <= SHIFT_MAX:
                     keep_px = [(i % SW + dx, i // SW + dy) for i in mask]
                     mask = [y * SW + x for x, y in keep_px if 0 <= x < SW and 0 <= y < SH]
                     if len(mask) < 20:
@@ -345,6 +355,11 @@ def cmd_shot(args):
         shutil.rmtree(work, ignore_errors=True)
         sys.exit(f"no frames arrived. {C.ff_err(err)[-300:]}")
     _, clear, motion, keep, sharp = best
+    if suspect and clear < 0.15:            # view differs AND the print isn't where it was: really moved
+        moved_big = True
+    if moved_big:
+        shutil.rmtree(work, ignore_errors=True)
+        sys.exit(f"CAMERA MOVED: {shift_note}; print visible {clear:.0%}. Re-run `print locate` + `print use`.")
     # reference = the sharpest best-frame any earlier shot of this camera/region produced (the locate
     # composite is itself soft, so it's a poor yardstick). Reset by `print use`.
     ref_file = sd / "sharp_ref.json"
@@ -394,10 +409,14 @@ def cmd_monitor(args):
     # doesn't hold the camera for 36 min
     args.max_wait = max(20, min(args.every * 0.6, 300))
     base_label, k = args.label or "monitor", 0
+    C.keep_awake("monitor")
+    next_t = time.time()
     print(f"monitoring every {C.human(args.every)} for up to {C.human(args.max_min * 60)} "
           f"(<= {C.human(args.max_wait)} search per shot) -> {out}", flush=True)
     while time.time() < end:
         t0, k = time.time(), k + 1
+        C.sleep_gap(next_t, args.every, k)
+        next_t = t0 + args.every
         args.label = f"{base_label}-{k:03d}"
         for attempt in (1, 2):
             # a leftover capture from an earlier round holds the camera: clear it first

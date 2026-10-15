@@ -12,7 +12,7 @@ pasted phone photo), and long jobs run in the background and only report what ma
 - "Take a look at the part on the desk": snapshot, cropped to the subject, with an optional grid
 - "Tell me when the glue has set / the print has finished": a watcher that stays silent until something changes
 - "Picture every 15 minutes for the next 6 hours": timelapse with an interval menu (5/10/15/30/45/60 min, or any duration)
-- "Watch my 3D print": finds the print on the bed and shoots it when the print head is out of the way; follows the phone if it gets bumped
+- "Watch my 3D print": finds the print on the bed and shoots it when the print head is out of the way; follows the phone if it gets bumped. Optionally reads your printer's local API (Ultimaker, PrusaLink, OctoPrint) to log progress, and takes a final clear shot and stops when the job ends
 - "Document this assembly": photo plus a numbered step in a `steps.md` build guide, per operation
 - "Film a 20-second demo": an MP4 (60 fps or audio optional) plus a keyframe sheet Claude can review cheaply
 - "Make a video of today's pictures": frames → MP4
@@ -55,11 +55,15 @@ as pasting a photo. Only record other people (user tests, co-design sessions) wi
 
 - macOS only (AVFoundation and Continuity Camera). No Windows or Linux yet.
 - No optical zoom through Continuity: close-ups are crops of the 1920×1440 frame.
-- The 3D-print mode assumes a dark print on a light bed.
+- The 3D-print mode handles a dark print on a light bed, or a light print on a dark bed, as long as the
+  print head is lighter than the bed. Tall prints on printers whose bed drops in Z drift down the frame.
+- Printer API support was built from the vendors' documentation and is tested against mock servers;
+  run `print printer-test` once with your printer to confirm.
 
 ## Updating (maintainers)
 
-Edit the working copy in `~/.claude/skills/camera`, run `scripts/sync_from_local.sh`, bump `version`
-in `.claude-plugin/plugin.json`, commit and push. Users get it with `/plugin marketplace update claude-camera`.
+Edit the working copy in `~/.claude/skills/camera`, run `scripts/sync_from_local.sh`, run
+`tests/run.sh` (regression tests on recorded fixtures, no camera or printer needed, ~3 min), bump
+`version` in `.claude-plugin/plugin.json`, commit and push. Users get it with `/plugin marketplace update claude-camera`.
 
 MIT licensed.

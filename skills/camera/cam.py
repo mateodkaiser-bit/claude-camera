@@ -143,7 +143,8 @@ def ff_start(ff_args, camera=True):
         pidf = err + ".pid"
         cmd = ["open", "-W", "-g", "-n", "-a", str(HELPER), "--stderr", err, "--args", pidf, *ff_args]
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), err, pidf
-    return subprocess.Popen([FFMPEG, *ff_args], stdout=subprocess.DEVNULL, stderr=open(err, "w")), err, None
+    with open(err, "w") as errf:
+        return subprocess.Popen([FFMPEG, *ff_args], stdout=subprocess.DEVNULL, stderr=errf), err, None
 
 
 def ff_stop(proc, pidf):
@@ -181,7 +182,156 @@ def run_ffmpeg(ff_args, camera=True, timeout=CAPTURE_TIMEOUT):
     except subprocess.TimeoutExpired:
         ff_stop(proc, pidf)
         sys.exit(PERMISSION_HELP)
-    return ff_err(err)
+    finally:
+        out = ff_err(err)
+        for f in (err, pidf):
+            if f:
+                Path(f).unlink(missing_ok=True)
+    return out
+
+
+class LiveStream:
+    """ONE ffmpeg held open for a whole job (keep-alive), instead of reconnecting the phone every round.
+    15 Oct: reconnecting after minutes of idle gave "no frames" rounds and dropouts; a stream that stays
+    up keeps Continuity awake. Frames land as numbered files in a per-connection folder and are deleted
+    as soon as they are read, so disk use stays flat however long the job runs.
+    If the stream dies (ffmpeg exits) or stalls (no new frame), it reconnects with backoff
+    (10 s, 20 s, 40 s ... capped at 5 min, reset by the next good frame), logging each attempt.
+
+    outputs: [(filter chain, file pattern)], e.g. [("scale=320:240,format=gray", "s%06d.pgm"),
+    ("null", "f%06d.jpg")]. The first pattern counts frames; the others are the same frame's siblings."""
+    BACKOFF = [10, 20, 40, 80, 160, 300]
+
+    def __init__(self, args, device, outputs, fps=2, tag="cam-live-", stall=25, log=None):
+        self.args, self.device, self.outputs, self.fps, self.stall = args, device, outputs, fps, stall
+        self.root = Path(tempfile.mkdtemp(prefix=tag))
+        self.log = log or (lambda m: print(f"[{ts()}] {m}", flush=True))
+        self.warm_s = 0 if args.input else (WARMUP_PHONE if "iphone" in device.lower() else WARMUP_FRAMES) / 30
+        # replaying a file ends at EOF; only reconnect on files when a test asks for it
+        self.reconnect = not args.input or bool(os.environ.get("CLAUDE_CAM_RECONNECT_FILES"))
+        self.scale = float(os.environ.get("CLAUDE_CAM_BACKOFF", "1"))
+        self.gen, self.fails, self.reconnects, self.proc = 0, 0, 0, None
+        self.start()
+
+    def start(self):
+        self.gen += 1
+        self.dir = self.root / f"c{self.gen}"
+        self.dir.mkdir()
+        n = len(self.outputs)
+        head = f"[0:v]trim=start={self.warm_s},setpts=PTS-STARTPTS,fps={self.fps}"
+        fc = head + (f",split={n}" + "".join(f"[o{k}]" for k in range(n)) + ";" if n > 1 else "[o0];")
+        fc += ";".join(f"[o{k}]{chain}[p{k}]" for k, (chain, _) in enumerate(self.outputs))
+        maps = [a for k, (_, pat) in enumerate(self.outputs)
+                for a in ("-map", f"[p{k}]", *(["-q:v", "2"] if pat.endswith(".jpg") else []), str(self.dir / pat))]
+        self.proc, self.errlog, self.pidf = ff_start(
+            ["-hide_banner", "-loglevel", "error", "-y", *input_args(self.args, self.device),
+             "-filter_complex", fc, *maps], camera=not self.args.input)
+        self.t_start, self.t_frame, self.last, self.prev = time.time(), None, 0, []
+
+    def stop(self):
+        if self.proc:
+            ff_stop(self.proc, self.pidf)
+            self.proc = None
+
+    def close(self):
+        self.stop()
+        shutil.rmtree(self.root, ignore_errors=True)
+        for f in (self.errlog, self.pidf):
+            if f:
+                Path(f).unlink(missing_ok=True)
+
+    def _siblings(self, f):
+        num = re.search(r"(\d+)\.\w+$", f.name).group(1)
+        return [self.dir / (re.sub(r"%0?\d*d", num, pat)) for _, pat in self.outputs[1:]]
+
+    def _ready(self, ended):
+        first = self.outputs[0][1]
+        prefix = first.split("%")[0]
+        fs = sorted(self.dir.glob(prefix + "*" + Path(first).suffix))
+        fs = fs if ended else fs[:-1]            # while ffmpeg runs, the newest may be half-written
+        return [f for f in fs if self._num(f) > self.last]
+
+    @staticmethod
+    def _num(f):
+        return int(re.search(r"(\d+)\.\w+$", f.name).group(1))
+
+    def _forget(self):
+        for f in self.prev:
+            f.unlink(missing_ok=True)
+        self.prev = []
+
+    def healthy(self, ended=None):
+        """False when the stream died or stalled; reconnects (with backoff) if allowed. Returns True if
+        frames should be flowing now. Pass `ended` as sampled BEFORE the last listing, or frames written
+        between that listing and now would be skipped."""
+        if ended is None:
+            ended = self.proc is None or self.proc.poll() is not None
+        quiet = time.time() - (self.t_frame or self.t_start)
+        limit = self.stall + (0 if self.t_frame else self.warm_s + 6)
+        if not ended and quiet < limit:
+            return True
+        if not self.reconnect:
+            return False
+        why = "ended" if ended else f"stalled (no frame for {quiet:.0f} s)"
+        err = ff_err(self.errlog).strip()[-160:] if ended else ""
+        self.stop()
+        for f in (self.errlog, self.pidf):
+            if f:
+                Path(f).unlink(missing_ok=True)
+        wait = self.BACKOFF[min(self.fails, len(self.BACKOFF) - 1)] * self.scale
+        self.fails += 1
+        self.reconnects += 1
+        self.log(f"stream {why}{': ' + err if err else ''}; reconnecting in {human(wait)} "
+                 f"(attempt {self.fails})")
+        time.sleep(wait)
+        # a stalled capture can linger inside ClaudeCam: clear this job's leftovers before reconnecting
+        subprocess.run(["pkill", "-9", "-f", str(self.root)], capture_output=True)
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.start()
+        return False
+
+    def frames(self, deadline):
+        """Yield (first-output path, [sibling paths]) for each new frame until the deadline. Survives
+        reconnects. Returns early only if the stream is dead and may not reconnect."""
+        while time.time() < deadline:
+            ended = self.proc is None or self.proc.poll() is not None
+            for f in self._ready(ended):
+                self.last = self._num(f)
+                sib = self._siblings(f)
+                for _ in range(20):              # a sibling of the same frame may land a moment later
+                    if all(s.exists() and s.stat().st_size > 0 for s in sib):
+                        break
+                    time.sleep(0.1)
+                self._forget()
+                self.prev = [f, *sib]
+                self.t_frame, self.fails = time.time(), 0
+                yield f, sib
+                if time.time() >= deadline:
+                    return
+            if not self.healthy(ended):
+                if not self.reconnect:
+                    return
+                continue
+            time.sleep(0.25)
+
+    def drain(self):
+        """Between rounds: throw away frames nobody needs, keep the stream checked. Returns the newest
+        complete frame's paths (first output, siblings) or None."""
+        ended = self.proc is None or self.proc.poll() is not None
+        fs = self._ready(ended)
+        if fs:
+            self.t_frame, self.fails = time.time(), 0
+        self._forget()
+        for f in fs[:-1]:
+            for p in (f, *self._siblings(f)):
+                p.unlink(missing_ok=True)
+        if fs:
+            self.last = self._num(fs[-1])
+            self.prev = [fs[-1], *self._siblings(fs[-1])]
+        newest = (fs[-1], self._siblings(fs[-1])) if fs else None
+        if not self.healthy(ended) and self.reconnect:
+            return None              # restarted: the old folder is gone
+        return newest
 
 
 def capture(args, out_path, extra_vf=(), warm=True):
@@ -349,21 +499,50 @@ def cmd_sheet(args):
 def cmd_timelapse(args):
     """A plain snap every `--every` for `--for`, same crop each time -> numbered frames that line up.
     For things that change slowly and are NOT a print on a bed (decay specimens, curing, a test rig).
-    One line per frame; Claude reads only the ones that matter."""
+    One line per frame; Claude reads only the ones that matter.
+    Keep-alive (default): one stream for the whole run, a frame taken from it each tick (no 5 s phone
+    warm-up per frame, no reconnect stalls). --release: reconnect per frame, camera free in between."""
     out = outdir(args)
     end, k, base = time.time() + args.for_, 0, args.label or "timelapse"
-    print(f"timelapse every {human(args.every)} for {human(args.for_)} -> {out}", flush=True)
+    print(f"timelapse every {human(args.every)} for {human(args.for_)} -> {out} "
+          f"(camera {'released between frames' if args.release else 'kept connected'})", flush=True)
     keep_awake("timelapse")
-    while time.time() < end:
-        t0, k = time.time(), k + 1
-        path = out / f"{base}-{k:03d}-{ts()}.jpg"
-        try:
-            dev = capture(args, path, grid_filter(args.grid, args.width))
-            report(path, dev)
-        except SystemExit as e:                 # camera lost: log and keep going
-            print(f"[{ts()}] frame {k} failed: {str(e)[:200]}", flush=True)
-        sys.stdout.flush()
-        time.sleep(max(0, min(args.every - (time.time() - t0), end - time.time())))
+    live = None
+    if not args.release:
+        device = None if args.input else resolve(args.cam)
+        chain = ",".join(crop_filter(args.crop) + [f"scale={args.width}:-2"] + grid_filter(args.grid, args.width))
+        # 1 frame every 2 s is plenty to pick from, and keeps the disk churn tiny
+        live = LiveStream(args, device, [(chain, "t%06d.jpg")], fps=0.5, tag="cam-tl-")
+    try:
+        while time.time() < end:
+            t0, k = time.time(), k + 1
+            path = out / f"{base}-{k:03d}-{ts()}.jpg"
+            if live:
+                got = None
+                for f, _ in live.frames(min(end, time.time() + 60)):   # the next fresh frame
+                    got = f
+                    break
+                if got:
+                    shutil.copy(got, path)
+                    report(path, live.device)
+                else:
+                    print(f"[{ts()}] frame {k} failed: no frame within 60 s (stream reconnecting)", flush=True)
+            else:
+                try:
+                    dev = capture(args, path, grid_filter(args.grid, args.width))
+                    report(path, dev)
+                except SystemExit as e:                 # camera lost: log and keep going
+                    print(f"[{ts()}] frame {k} failed: {str(e)[:200]}", flush=True)
+            sys.stdout.flush()
+            while time.time() < min(end, t0 + args.every):
+                if live:
+                    live.drain()
+                time.sleep(min(1, max(0, args.every - (time.time() - t0))))
+    finally:
+        if live:
+            if live.reconnects:
+                print(f"[{ts()}] stream reconnected {live.reconnects}x during the timelapse", flush=True)
+            live.close()
     print(f"[{ts()}] timelapse finished after {k} frames", flush=True)
 
 
@@ -481,8 +660,10 @@ def main():
     tl = sub.add_parser("timelapse", parents=[common], help="a snap every N for a duration")
     tl.add_argument("--every", type=duration, default=300, help=" / ".join(INTERVALS) + " (or any 90s / 2h)")
     tl.add_argument("--for", dest="for_", type=duration, default=7200, help="how long, e.g. 3h or 48h")
+    tl.add_argument("--release", action="store_true",
+                    help="free the camera between frames (reconnects each frame) instead of keep-alive")
     pr = sub.add_parser("print", parents=[common], help="find the print, shoot it when the head is clear")
-    pr.add_argument("action", choices=["locate", "use", "shot", "monitor"])
+    pr.add_argument("action", choices=["locate", "use", "shot", "monitor", "printer-setup", "printer-test"])
     pr.add_argument("ids", nargs="?", help="for `use`: candidate numbers from locate, e.g. 1,3")
     pr.add_argument("--seconds", type=float, default=40, help="locate: recording length")
     pr.add_argument("--grow", type=float, default=0.15, help="use: also take dark-on-bed pixels this far (frame fraction) around the picks")
@@ -491,6 +672,14 @@ def main():
     pr.add_argument("--max-min", type=float, default=150, help="monitor: stop after N minutes")
     pr.add_argument("--for", dest="for_", type=duration, help="monitor: how long, e.g. 3h (overrides --max-min)")
     pr.add_argument("--clear", type=float, default=0.85, help="shot: share of the print that must be visible")
+    pr.add_argument("--invert", choices=["auto", "on", "off"], default="auto",
+                    help="locate: light print on a dark bed (auto = decide from the bed's brightness)")
+    pr.add_argument("--printer", choices=["ultimaker", "prusalink", "octoprint"],
+                    help="monitor: also read the printer's API (state, progress, head position)")
+    pr.add_argument("--host", help="printer IP or hostname, for --printer")
+    pr.add_argument("--layer-height", type=float, help="monitor: turn Z into a layer number in the log")
+    pr.add_argument("--release", action="store_true",
+                    help="monitor: free the camera between shots (reconnects each round) instead of keep-alive")
     sub.add_parser("setup", parents=[common], help="first run on a new Mac: check + fix everything")
     st = sub.add_parser("step", parents=[common], help="assembly/build documentation: photo + numbered step")
     st.add_argument("text", help="what this step is, e.g. 'press bearing into hub'")

@@ -11,47 +11,40 @@ logos are dark too), so a human or Claude confirms once from the annotated image
 `shot` is pure pixel arithmetic: a frame is "clear" when the ROI matches the clean plate.
 Stdlib only; analysis runs at 320x240 grey, the saved crop comes from the 1920x1440 frame.
 """
-import json, shutil, subprocess, sys, tempfile, time
+import json, os, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 
 import cam as C
 
 SW, SH = 320, 240                       # analysis resolution
-STATE = Path.home() / ".claude" / "camera-state"
-COLORS = ["red", "cyan", "magenta", "lime", "orange", "blue", "yellow", "white"]
+STATE = Path(os.environ.get("CLAUDE_CAM_STATE") or Path.home() / ".claude" / "camera-state")
+COLORS = ["red", "cyan", "magenta", "lime", "orange", "blue", "yellow", "white",
+          "pink", "gold", "violet", "springgreen"]
 
 
 # ---------------------------------------------------------------- streaming
-def stream(args, device, work, fps=2):
-    """ffmpeg -> work/sNNNNNN.pgm (320x240 grey) + work/fNNNNNN.jpg (full res), `fps` per second."""
-    warm_s = 0 if args.input else (C.WARMUP_PHONE if "iphone" in device.lower() else C.WARMUP_FRAMES) / 30
-    fc = (f"[0:v]trim=start={warm_s},setpts=PTS-STARTPTS,fps={fps},split[a][b];"
-          f"[a]scale={SW}:{SH},format=gray[s];[b]null[f]")
-    return C.ff_start(["-hide_banner", "-loglevel", "error", "-y", *C.input_args(args, device),
-                       "-filter_complex", fc, "-map", "[s]", str(work / "s%06d.pgm"),
-                       "-map", "[f]", "-q:v", "2", str(work / "f%06d.jpg")], camera=not args.input)
+PRINT_OUTPUTS = [(f"scale={SW}:{SH},format=gray", "s%06d.pgm"), ("null", "f%06d.jpg")]
+INVERT = bytes(range(255, -1, -1))     # bytes.translate table: light print on a dark bed -> dark on light
 
 
-def frames(proc, work, deadline, stall=25):
-    """Yield (grey bytes, jpg path) for each completed frame until deadline or the stream ends.
-    Gives up after `stall` s with no frame at all: a stalled Continuity stream otherwise eats the window."""
-    seen, t0 = 0, time.time()
-    while True:
-        if seen == 0 and time.time() - t0 > stall + 6:   # +6: the phone's warm-up is trimmed off
-            return
-        ended = proc.poll() is not None
-        fs = sorted(work.glob("s*.pgm"))
-        for f in fs[seen:] if ended else fs[seen:-1]:
-            seen += 1
-            jpg = work / f.name.replace("s", "f", 1).replace(".pgm", ".jpg")
-            for _ in range(20):                  # the jpg of the same frame may land a moment later
-                if jpg.exists() and jpg.stat().st_size > 0:
-                    break
-                time.sleep(0.1)
-            yield C.read_pgm(f)[2], jpg
-        if ended or time.time() > deadline:
-            return
-        time.sleep(0.25)
+def open_stream(args, device, tag="cam-shot-"):
+    """2 fps: a 320x240 grey frame for analysis + the full-resolution JPEG of the same moment."""
+    return C.LiveStream(args, device, PRINT_OUTPUTS, fps=2, tag=tag)
+
+
+def frames(live, deadline, invert=False):
+    """Yield (grey bytes, jpg path) per frame until the deadline (reconnecting if the stream dies).
+    With invert, grey is flipped so the print is always the DARK thing (light filament on a dark bed)."""
+    for f, sib in live.frames(deadline):
+        g = C.read_pgm(f)[2]
+        yield (g.translate(INVERT) if invert else g), sib[0]
+
+
+def bed_is_dark(med):
+    """Auto polarity: the bed is the big flat area in the lower-middle of the view. If that region's
+    median grey is under 100, assume a dark bed (black PEI, satin sheet) and a light print."""
+    region = sorted(med[y * SW + x] for y in range(SH // 2, SH * 9 // 10, 2) for x in range(SW // 5, SW * 4 // 5, 2))
+    return region[len(region) // 2] < 100
 
 
 def state_dir(device):
@@ -109,6 +102,37 @@ def components(mask):
     return out
 
 
+def _erode_set(s, k):
+    for _ in range(k):
+        s = {i for i in s if all(j in s for j in (i - 1, i + 1, i - SW, i + SW, i - SW - 1, i - SW + 1,
+                                                  i + SW - 1, i + SW + 1))}
+    return s
+
+
+def split_thin(px, k=3, min_area=30):
+    """Cut a blob into its compact parts, dropping thin strokes. A rod smear in the composite is a
+    long line a few px wide; a plate is compact. Eroding k times deletes anything under ~2k+1 px wide
+    (the smear), the compact cores survive, and k constrained dilations grow each core back to its own
+    outline without re-joining the stroke (seen 15 Oct: plates merged with a rod smear into one box)."""
+    blob = set(px)
+    cores = _erode_set(blob, k)
+    if not cores:
+        return []
+    m = [False] * (SW * SH)
+    for i in cores:
+        m[i] = True
+    parts = []
+    for comp in components(m):
+        if len(comp) < 8:
+            continue
+        part = set(comp)
+        for _ in range(k + 1):              # +1 restores the boundary pixels erosion shaved off
+            part |= {j for i in part for j in (i - 1, i + 1, i - SW, i + SW) if j in blob}
+        if len(part) >= min_area:
+            parts.append(sorted(part))
+    return parts
+
+
 def find_candidates(med):
     lm = local_mean(med, 12)
     # local contrast finds small parts; the absolute test finds LARGE solid parts (first-layer plates),
@@ -117,8 +141,19 @@ def find_candidates(med):
     # opening (erode once, dilate once): removes 1-2 px specks/edges; belts are handled by the
     # thickness test below, which works at any angle (a bbox-aspect test misses diagonal belts)
     core = morph(morph(dark, "erode"), "dilate")
-    cands = []
+    blobs = []
     for px in components(core):
+        if len(px) < 30:
+            continue
+        xs, ys = [i % SW for i in px], [i // SW for i in px]
+        fill = len(px) / ((max(xs) - min(xs) + 1) * (max(ys) - min(ys) + 1))
+        # a sparse blob (it fills little of its box) is usually compact parts joined by a thin rod
+        # smear or a belt: keep only the compact parts
+        blobs += split_thin(px) if fill < 0.35 and len(px) > 150 else [px]
+    # a dim patch with almost no contrast is shading, not a part
+    blobs = [px for px in blobs if len(px) >= 30 and sum(lm[i] - med[i] for i in px) / len(px) >= 12]
+    cands = []
+    for px in blobs:
         if len(px) < 30:            # specks and logo letters (12-24 px here); real parts were 110+ px
             continue
         xs, ys = [i % SW for i in px], [i // SW for i in px]
@@ -128,16 +163,23 @@ def find_candidates(med):
         if thickness < 3.5 and max(bw, bh) > 25:           # long and thin: belt, rail edge, rod shadow
             continue
         contrast = sum(lm[i] - med[i] for i in px) / len(px)
-        # "on the bed": mean brightness of a 4 px ring around the box in the head-free median
-        ring = [med[y * SW + x] for y in range(max(0, y0 - 4), min(SH, y1 + 5))
-                for x in range(max(0, x0 - 4), min(SW, x1 + 5)) if not (x0 <= x <= x1 and y0 <= y <= y1)]
-        bed = sum(ring) / len(ring) / 255 if ring else 0
+        # "on the bed": brightness of a 4 px ring around the box in the head-free composite. The 70th
+        # percentile, not the mean: plates printed side by side darken each other's rings, and the mean
+        # ranked the 15 Oct first-layer plates below the logo and rails (off the top-8 list entirely).
+        ring = sorted(med[y * SW + x] for y in range(max(0, y0 - 4), min(SH, y1 + 5))
+                      for x in range(max(0, x0 - 4), min(SW, x1 + 5)) if not (x0 <= x <= x1 and y0 <= y <= y1))
+        bed = ring[int(len(ring) * 0.7)] / 255 if ring else 0
         cands.append(dict(box=[x0, y0, x1, y1], area=len(px), contrast=round(contrast), bed=round(bed, 2),
                           score=round(len(px) * contrast * bed ** 2), px=px))
     # being ON the bright bed is what separates print from hardware (belts, clips, rails are dark too),
     # so it is the primary key (0.1 buckets); size x contrast breaks ties
     cands.sort(key=lambda c: (-round(c["bed"], 1), -c["score"]))
-    return cands[:len(COLORS)]
+    # ...but bed brightness falls off across the frame, and on 15 Oct the first-layer plates sat in the
+    # darker bottom and ranked 12th-18th. So also keep the largest blobs: a big, dark, compact blob is
+    # exactly what a plate looks like, and missing a part costs more than one extra box to reject.
+    keep = cands[:6]
+    keep += [c for c in sorted(cands, key=lambda c: -c["area"]) if c not in keep][:len(COLORS) - 6]
+    return sorted(keep, key=cands.index)
 
 
 def down(img, f):
@@ -198,23 +240,36 @@ def cell(x, y):
 # ---------------------------------------------------------------- commands
 def cmd_locate(args):
     device = None if args.input else C.resolve(args.cam)
-    work = Path(tempfile.mkdtemp(prefix="cam-locate-"))
-    proc, err, pidf = stream(args, device, work)
+    live = open_stream(args, device, tag="cam-locate-")
     print(f"recording {args.seconds:.0f} s of '{device or args.input}' to build the head-free view...",
           file=sys.stderr, flush=True)
     try:
-        grey = [g for g, _ in frames(proc, work, time.time() + args.seconds + 8)]
+        grey = []
+        for g, _ in frames(live, time.time() + args.seconds + live.warm_s + 15):
+            grey.append(g)
+            if len(grey) >= args.seconds * 2:
+                break
+        err = C.ff_err(live.errlog)
     finally:
-        C.ff_stop(proc, pidf)
+        live.close()
     if len(grey) < 10:
-        shutil.rmtree(work, ignore_errors=True)
-        sys.exit(f"only {len(grey)} frames arrived. {C.ff_err(err)[-300:]}")
+        sys.exit(f"only {len(grey)} frames arrived. {err[-300:]}")
     n = len(grey)
     med, low = [0] * (SW * SH), [0] * (SW * SH)
     for i in range(SW * SH):
         col = sorted(g[i] for g in grey)
         med[i], low[i] = col[n // 2], col[n // 4]
+    # Polarity. Detection wants the print DARK on a LIGHT bed. A light print on a dark bed (white PLA on
+    # black PEI) is the same picture inverted, so invert the composites and every later frame.
+    # The 25th percentile is taken BEFORE inverting: it removes the head because the head is lighter
+    # than what it covers, which holds for either print colour.
+    inv = {"on": True, "off": False}.get(args.invert, None)
+    if inv is None:
+        inv = bed_is_dark(med)
+    if inv:
+        med, low = [255 - v for v in med], [255 - v for v in low]
     sd = state_dir(device)
+    (sd / "view.json").write_text(json.dumps({"invert": inv}))
     write_pgm(sd / "median.pgm", med)   # camera-moved check
     # Detect on the 25th percentile, not the median: the head dwells over the part it is printing,
     # often >50% of the time (seen 15 Oct: the median there was mostly head). The print only has to
@@ -229,10 +284,12 @@ def cmd_locate(args):
     vf = f"scale={SW * 2}:{SH * 2},format=rgb24,drawgrid=w=iw/8:h=ih/6:t=1:c=yellow@0.35" + ("," + boxes if boxes else "")
     C.run_ffmpeg(["-hide_banner", "-loglevel", "error", "-y", "-i", str(sd / "low.pgm"), "-vf", vf,
                   "-q:v", "3", str(out)], camera=False)
-    shutil.rmtree(work, ignore_errors=True)
-    C.report(out, device, f"\n  print-visible composite (25th percentile) of {n} frames, grid 8x6 (A1 top-left, H6 bottom-right)")
+    C.report(out, device, f"\n  print-visible composite (25th percentile) of {n} frames, grid 8x6 (A1 top-left, H6 bottom-right)"
+             + ("\n  DARK BED: light print on a dark bed assumed, so the image is shown INVERTED (print dark)"
+                + (" (auto; force with --invert off)" if args.invert == "auto" else "") if inv else ""))
     if not cands:
-        print("  no dark-on-bed candidates found. Is the print in view and darker than the bed?")
+        print("  no print candidates found. Is the print in view and does it contrast with the bed? "
+              "(light filament on a dark bed: try --invert on)")
     for k, c in enumerate(cands, 1):
         x0, y0, x1, y1 = c["box"]
         print(f"  {k} {COLORS[k - 1]:8s} cells {cell(x0, y0)}-{cell(x1, y1)}  area {c['area']} px  "
@@ -256,7 +313,7 @@ def cmd_use(args):
     bed_lvl = sum(low[i] for i in ring) / len(ring)
     thr = (print_lvl + bed_lvl) / 2       # a mask pixel darker than this = print visible there
     # Grow: the confirmed boxes are seeds. Neighbouring parts of the same plate are often too faint or
-    # small to make the top-8 list, so add every dark-on-bed pixel near the seeds (within args.grow of
+    # small to make the candidate list, so add every dark-on-bed pixel near the seeds (within args.grow of
     # the frame) and drop specks. Region = bbox of the grown mask.
     g = int(args.grow * SW)
     lm = local_mean(low, 12)
@@ -277,18 +334,26 @@ def cmd_use(args):
           f"({(x1 - x0 + 1) / SW:.0%} x {(y1 - y0 + 1) / SH:.0%} of the frame), {len(mask)} print px, print {print_lvl:.0f} vs bed {bed_lvl:.0f} grey. Now: cam.py print shot")
 
 
-def cmd_shot(args):
+def cmd_shot(args, live=None, api=None, final=False):
+    """Stream until the print region is clear of the head; save a native-resolution crop.
+    live: a keep-alive LiveStream from `monitor` (else this opens and closes its own).
+    api: a cam_printer.Printer; its head track is a second opinion on "the head is away".
+    final: the job has ended: also save a full frame, and don't treat "print not where it was" as a
+    moved camera (on bed-drops-in-Z printers the finished part sits lower in the view)."""
     device = None if args.input else C.resolve(args.cam)
     sd = state_dir(device)
     if not (sd / "roi.json").exists():
         sys.exit("no print region saved for this camera: run `cam.py print locate`, then `print use`.")
     med = C.read_pgm(sd / "median.pgm")[2]
     st = json.loads((sd / "roi.json").read_text())
+    inv = json.loads((sd / "view.json").read_text()).get("invert", False) if (sd / "view.json").exists() else False
     x0, y0, x1, y1 = st["roi"]
     mask, thr = st["mask"], st["thr"]
     roi = [y * SW + x for y in range(y0, y1 + 1) for x in range(x0, x1 + 1)]
-    work = Path(tempfile.mkdtemp(prefix="cam-shot-"))
-    proc, err, pidf = stream(args, device, work)
+    work = Path(tempfile.mkdtemp(prefix="cam-best-"))
+    own = live is None
+    if own:
+        live = open_stream(args, device)
     print(f"waiting up to {args.max_wait:.0f} s for the head to clear the print...", file=sys.stderr, flush=True)
     best, prev, n, glob_match, max_sharp, frozen = None, None, 0, [], 0.0, 0
     warm, aligned, shift_note, moved_big, suspect = [], False, "", False, False
@@ -297,8 +362,10 @@ def cmd_shot(args):
     def sharpness(img):
         return sum(abs(img[i] - img[i + 1]) + abs(img[i] - img[i + SW]) for i in roi
                    if i % SW < SW - 1 and i + SW < SW * SH) / len(roi)
+    if api:
+        api.start_sampling(1.0)
     try:
-        for g, jpg in frames(proc, work, time.time() + args.max_wait + 8):
+        for g, jpg in frames(live, time.time() + args.max_wait + (8 if own else 0), inv):
             n += 1
             if not aligned:
                 # Auto-adapt: the median of the first 3 s (the head barely counts) vs the saved view.
@@ -339,25 +406,30 @@ def cmd_shot(args):
                     best = None
             if sharp < 0.6 * max_sharp or frozen >= 3:
                 continue
-            score = clear - motion / 200
+            # printer cue: the head far from where it dwells (= off the part), or a layer change
+            away, layer = api.head_context() if api else (None, False)
+            cue = (away is not None and away >= 60) or layer
+            score = clear - motion / 200 + (0.05 if cue else 0)
             if best is None or score > best[0]:
                 keep = work / f"best{jpg.suffix}"
                 shutil.copy(jpg, keep)
-                best = (score, clear, motion, keep, sharp)
-            if clear >= args.clear and motion < 6:
+                best = (score, clear, motion, keep, sharp, away, layer)
+            if motion < 6 and (clear >= args.clear or (cue and clear >= args.clear - 0.15)):
                 break
     finally:
-        C.ff_stop(proc, pidf)
-    if moved_big:
+        if api:
+            api.stop_sampling()
+        err = C.ff_err(live.errlog)
+        if own:
+            live.close()
+    if moved_big and not final:
         shutil.rmtree(work, ignore_errors=True)
         sys.exit(f"CAMERA MOVED: {shift_note}. Re-run `print locate` + `print use`.")
     if best is None:
         shutil.rmtree(work, ignore_errors=True)
-        sys.exit(f"no frames arrived. {C.ff_err(err)[-300:]}")
-    _, clear, motion, keep, sharp = best
-    if suspect and clear < 0.15:            # view differs AND the print isn't where it was: really moved
-        moved_big = True
-    if moved_big:
+        sys.exit(f"no frames arrived. {err[-300:]}")
+    _, clear, motion, keep, sharp, away, layer = best
+    if suspect and clear < 0.15 and not final:   # view differs AND the print isn't where it was: really moved
         shutil.rmtree(work, ignore_errors=True)
         sys.exit(f"CAMERA MOVED: {shift_note}; print visible {clear:.0%}. Re-run `print locate` + `print use`.")
     # reference = the sharpest best-frame any earlier shot of this camera/region produced (the locate
@@ -380,14 +452,26 @@ def cmd_shot(args):
     C.run_ffmpeg(["-hide_banner", "-loglevel", "error", "-y", "-i", str(keep), "-vf",
                   f"crop={cw}:{ch}:{int(cx0 * fw)}:{int(cy0 * fh)},scale={outw}:-2", "-q:v", "2", str(out)],
                  camera=False)
+    full = None
+    if final:                                   # the whole view too: the part may have moved with the bed
+        full = out.with_name(out.stem + "-full.jpg")
+        C.run_ffmpeg(["-hide_banner", "-loglevel", "error", "-y", "-i", str(keep), "-vf",
+                      f"scale={min(fw, args.width)}:-2", "-q:v", "2", str(full)], camera=False)
     shutil.rmtree(work, ignore_errors=True)
     verdict = "print in view" if clear >= args.clear else f"best available, ~{1 - clear:.0%} of the print still hidden"
     # 15 Oct: the phone was moved mid-monitor and the whole-view check missed it (a bright scene still
     # "matches" a bright median). Almost none of the print visible in ANY frame = moved or print removed.
-    moved = sum(glob_match) / len(glob_match) < 0.45 or clear < 0.10
+    moved = not final and (sum(glob_match) / max(1, len(glob_match)) < 0.45 or clear < 0.10)
+    cue_note = ""
+    if api:
+        cue_note = "\n  " + api.describe(layer_height=getattr(args, "layer_height", None))
+        if away is not None:
+            cue_note += f"; head {away} mm from its dwell point" + (", layer change" if layer else "")
     C.report(out, device, f"\n  {verdict}: {clear:.0%} of the print's pixels visible, "
                           f"motion {motion:.1f}, sharpness {sharp:.0f} (best seen {ref_sharp:.0f}), after {n} frames; "
                           f"crop {cw}x{ch} native px"
+             + cue_note
+             + (f"\n  full view: {full}" if full else "")
              + ("\n  WARNING: BLURRY, every frame was soft (autofocus hunting or a smudged lens)"
                 if sharp < 0.5 * ref_sharp else "")
              + ("\n  WARNING: stream FROZE (identical frames). Phone locked or stalled?" if frozen >= 3 else "")
@@ -397,56 +481,145 @@ def cmd_shot(args):
     return "moved" if moved else "ok"
 
 
+def _printer(args):
+    if not getattr(args, "printer", None):
+        return None
+    if not args.host:
+        sys.exit("--printer needs --host <printer IP>")
+    from cam_printer import Printer
+    return Printer(args.printer, args.host)
+
+
+def _final_shot(args, live, api, out_label):
+    """The job ended: wait for the head to park (position steady for 3 polls, <= 45 s), then one shot
+    that demands a clear print, plus the full view."""
+    xy, steady, t_end = None, 0, time.time() + 45
+    while time.time() < t_end and steady < 3:
+        r = api.poll()
+        cur = (r.get("x"), r.get("y"))
+        steady = steady + 1 if cur == xy and cur[0] is not None else 0
+        xy = cur
+        if live:
+            live.drain()
+        time.sleep(3)
+    args.label, args.clear, args.max_wait = out_label, 0.9, 60
+    return cmd_shot(args, live, None, final=True)
+
+
 def cmd_monitor(args):
     """A print shot every args.every seconds. Each cycle waits up to 60% of `every` for the clearest
     frame, so mid-print shots are as unobstructed as the head allows. Same crop every time, so the
-    numbered files line up as a time-lapse. One line per shot on stdout; images are NOT shown to Claude."""
+    numbered files line up as a time-lapse. One line per shot on stdout; images are NOT shown to Claude.
+
+    Keep-alive (default): ONE camera stream for the whole job (see C.LiveStream); --release instead
+    connects per round and leaves the camera free in between (for sharing the phone, or saving battery).
+    --printer/--host: poll the printer API; log progress/Z per shot, prefer moments the head is away or
+    changing layer, and when the job ends take a final clear shot and stop."""
     out = C.outdir(args)
     if getattr(args, "for_", None):
         args.max_min = args.for_ / 60
     end = time.time() + args.max_min * 60
-    # search <=60% of the cycle (camera free the rest) and never more than 5 min, so a 60m interval
-    # doesn't hold the camera for 36 min
+    # search <=60% of the cycle and never more than 5 min, so a 60m interval doesn't hold the search
+    # (and, with --release, the camera) for 36 min
     args.max_wait = max(20, min(args.every * 0.6, 300))
     base_label, k = args.label or "monitor", 0
+    api = _printer(args)
+    if api:
+        r = api.poll()
+        print(f"[{C.ts()}] {api.kind} at {api.host}: {api.describe(r, args.layer_height)}", flush=True)
+        if r["state"] == "unreachable":
+            print(f"[{C.ts()}] NOTE: printer not reachable; monitoring visually, will keep trying.", flush=True)
+    seen_printing = bool(api and api.last["state"] in ("printing", "paused"))
     C.keep_awake("monitor")
+    device = None if args.input else C.resolve(args.cam)
+    live = None
+    if not args.release:
+        subprocess.run(["pkill", "-9", "-f", "cam-live-"], capture_output=True)   # a crashed earlier monitor
+        live = open_stream(args, device, tag="cam-live-")
     next_t = time.time()
     print(f"monitoring every {C.human(args.every)} for up to {C.human(args.max_min * 60)} "
-          f"(<= {C.human(args.max_wait)} search per shot) -> {out}", flush=True)
-    while time.time() < end:
-        t0, k = time.time(), k + 1
-        C.sleep_gap(next_t, args.every, k)
-        next_t = t0 + args.every
-        args.label = f"{base_label}-{k:03d}"
-        for attempt in (1, 2):
-            # a leftover capture from an earlier round holds the camera: clear it first
-            subprocess.run(["pkill", "-9", "-f", "cam-shot-"], capture_output=True)
-            try:
-                status = cmd_shot(args)
-            except SystemExit as e:      # stalled / camera lost: retry once after 10 s, then log and go on
-                status = "moved" if str(e).startswith("CAMERA MOVED") else "failed"
-                print(f"[{C.ts()}] shot {k} attempt {attempt}: {str(e)[:160]}", flush=True)
-            if status == "moved":
-                # Big move: shifting can't fix it, and telling print from logo/rods needs eyes. Re-locate
-                # now (so the annotated image is ready), then STOP: the job ending notifies Claude, who
-                # confirms with `print use` and restarts. Small bumps never get here: shot follows them.
-                print(f"[{C.ts()}] camera moved: re-locating...", flush=True)
-                args.label = f"{base_label}-relocate"
-                try:
-                    cmd_locate(args)
-                except SystemExit as e:
-                    print(f"[{C.ts()}] re-locate failed: {str(e)[:160]}", flush=True)
-                print(f"[{C.ts()}] NEEDS CONFIRM: read the locate image above, run `print use <ids>`, "
-                      f"then restart the monitor.", flush=True)
-                sys.exit(3)
-            if status == "ok":
+          f"(<= {C.human(args.max_wait)} search per shot, camera {'released between shots' if args.release else 'kept connected'}) -> {out}",
+          flush=True)
+
+    def job_done():
+        nonlocal seen_printing
+        if not api:
+            return False
+        r = api.poll()
+        if r["state"] in ("printing", "paused"):
+            seen_printing = True
+        return r["state"] == "finished" or (seen_printing and r["state"] == "idle")
+
+    try:
+        while time.time() < end:
+            if job_done():
                 break
-            if attempt == 1:
-                time.sleep(10)
-        sys.stdout.flush()
-        time.sleep(max(0, args.every - (time.time() - t0)))
+            t0, k = time.time(), k + 1
+            C.sleep_gap(next_t, args.every, k)
+            next_t = t0 + args.every
+            args.label = f"{base_label}-{k:03d}"
+            if api and api.last and api.last["state"] in ("paused", "error"):
+                print(f"[{C.ts()}] PRINTER ATTENTION: {api.describe()}", flush=True)
+            for attempt in (1, 2):
+                if args.release:
+                    # a leftover capture from an earlier round holds the camera: clear it first
+                    subprocess.run(["pkill", "-9", "-f", "cam-shot-"], capture_output=True)
+                try:
+                    status = cmd_shot(args, live, api)
+                except SystemExit as e:      # stalled / camera lost: retry once after 10 s, then log and go on
+                    status = "moved" if str(e).startswith("CAMERA MOVED") else "failed"
+                    print(f"[{C.ts()}] shot {k} attempt {attempt}: {str(e)[:160]}", flush=True)
+                if status == "moved":
+                    # Big move: shifting can't fix it, and telling print from logo/rods needs eyes. Re-locate
+                    # now (so the annotated image is ready), then STOP: the job ending notifies Claude, who
+                    # confirms with `print use` and restarts. Small bumps never get here: shot follows them.
+                    print(f"[{C.ts()}] camera moved: re-locating...", flush=True)
+                    if live:
+                        live.close()
+                        live = None
+                    args.label = f"{base_label}-relocate"
+                    try:
+                        cmd_locate(args)
+                    except SystemExit as e:
+                        print(f"[{C.ts()}] re-locate failed: {str(e)[:160]}", flush=True)
+                    print(f"[{C.ts()}] NEEDS CONFIRM: read the locate image above, run `print use <ids>`, "
+                          f"then restart the monitor.", flush=True)
+                    sys.exit(3)
+                if status == "ok":
+                    break
+                if attempt == 1:
+                    time.sleep(10)
+            sys.stdout.flush()
+            # wait for the next round; keep-alive drains the stream (and reconnects it if it died),
+            # and the printer is checked every 15 s so the end of the job is caught promptly
+            last_poll = time.time()
+            while time.time() < min(end, t0 + args.every):
+                if live:
+                    live.drain()
+                if api and time.time() - last_poll >= 15:
+                    last_poll = time.time()
+                    if job_done():
+                        break
+                time.sleep(1)
+        if api and api.last and (api.last["state"] == "finished" or (seen_printing and api.last["state"] == "idle")):
+            print(f"[{C.ts()}] JOB FINISHED ({api.describe()}): final shot once the head parks...", flush=True)
+            try:
+                _final_shot(args, live, api, f"{base_label}-final")
+            except SystemExit as e:
+                print(f"[{C.ts()}] final shot failed: {str(e)[:160]}", flush=True)
+            print(f"[{C.ts()}] monitor stopped: the print finished, after {k} shots", flush=True)
+            return
+    finally:
+        if live:
+            if live.reconnects:
+                print(f"[{C.ts()}] stream reconnected {live.reconnects}x during the job", flush=True)
+            live.close()
     print(f"[{C.ts()}] monitor finished after {k} shots", flush=True)
 
 
 def cmd_print(args):
+    if args.action in ("printer-setup", "printer-test"):
+        import cam_printer
+        return {"printer-setup": cam_printer.cmd_printer_setup,
+                "printer-test": cam_printer.cmd_printer_test}[args.action](args)
     {"locate": cmd_locate, "use": cmd_use, "shot": cmd_shot, "monitor": cmd_monitor}[args.action](args)

@@ -36,7 +36,7 @@ fallback (`--cam mac`).
 | To compare states | `sheet --n 4 --every 30s` | N frames tiled into ONE image |
 | To be told when something happens | `watch --every 30s --until-change` | Silent until a change; names the region |
 | Progress pictures over time | `timelapse --every 15m --for 6h` | Same framing every time |
-| A 3D print watched | `print locate` → `print use <ids>` → `print monitor --every 5m --for 3h` | Shoots when the head is clear |
+| A 3D print watched | `print locate` → `print use <ids>` → `print monitor --every 5m --for 3h [--printer ultimaker --host IP]` | Shoots when the head is clear; with a printer API also logs progress/Z and stops with a final shot when the job ends |
 | Assembly / build documented | `step "press bearing into hub" --project NAME [--note "..."]` | Photo plus a numbered entry in `steps.md` |
 | A product demo video | `clip --seconds 20 [--fps 60] [--audio] --project NAME` | MP4 plus a keyframe sheet |
 | A video from pictures | `compile <folder> [--match 'x-*.jpg'] [--fps 8]` | Timelapse, monitor or steps → MP4 |
@@ -48,8 +48,11 @@ glue or drying, 60m for slow processes over days.
 
 **Long jobs** (`timelapse`, `watch`, `print monitor`): run them with `run_in_background`, as
 `python3 -u ... | tee <out>/run.log`. They print one line per frame and keep going after a failed
-frame. Don't Read every image: grep the log for `failed` / `WARNING`, look when a line looks off, and
-look at the end.
+frame. Don't Read every image: grep the log for `failed` / `WARNING` / `reconnect`, look when a line
+looks off, and look at the end. `timelapse` and `print monitor` hold **one camera stream for the whole
+job** (keep-alive) and reconnect it with backoff if it dies or stalls; add `--release` to free the
+camera between frames instead (the phone is needed for something else, or the job is days long and the
+battery matters more than reliability).
 
 **Projects.** `--project NAME` finds `projects/NAME/` in the current directory or a parent. Running from
 inside a project folder works without the flag. Output goes to `projects/NAME/media/{cam,steps,clips}/`.
@@ -123,10 +126,37 @@ never enter the main context.
 3. **`print shot` / `print monitor`** stream at 2 fps and score each frame by **the share of print
    pixels visible right now**. They skip blurry frames and save a native-resolution crop. Mid-print,
    the head may never fully clear (60–75% visible is normal); for a clear plate, shoot after the print
-   ends. Assumes a **dark print on a light bed**; light-on-dark isn't built yet.
+   ends (or let the printer API do it, below).
+   **Light filament on a dark bed** (white PLA on black PEI): `locate` checks the bed's brightness and,
+   if it is dark, inverts the analysis so the print is the dark thing again; the locate image is then
+   shown inverted and says `DARK BED`. Force it with `--invert on|off`. The 25th-percentile composite is
+   taken *before* inverting: it removes the head because the head is lighter than what it covers, which
+   holds for either print colour. A **dark head** on a light bed breaks that assumption (not built).
    **Large flat parts** (first-layer plates) fill the 25 px contrast window, so detection also accepts
-   any pixel darker than 70. With a close phone they can merge with rod smears into one big blob;
-   selecting that blob still works for monitoring (the crop covers the parts), it's just a looser crop.
+   any pixel darker than 70. `locate` boxes up to **12** candidates: the 6 best "on the bed" plus the 6
+   largest, because bed brightness falls off across the frame and on 15 Oct three plates in the darker
+   bottom ranked 12th–18th and were never boxed. Plates merged with a **rod smear** (a thin moving line in
+   the composite) are split: sparse blobs are eroded 3 px, which deletes anything under ~7 px wide, and
+   each compact core is grown back inside its own outline.
+
+**Printer API (optional, `--printer ultimaker|prusalink|octoprint --host <ip>`).** Numbers beat pixels
+when you have them. One-time: `print printer-setup --printer prusalink --host <ip>` writes
+`~/.claude/camera-state/printers.json` (mode 600) with empty fields; **the user fills in the password or
+key in a text editor, never in the chat**. Ultimaker needs nothing (its local API reads without a
+key). `print printer-test ...` shows what the printer answers. With it, `monitor`:
+- logs `printer printing, 42%, Z 3.20 mm (~layer 16)` per shot (`--layer-height 0.2` for the layer
+  number; OctoPrint gives state and progress only, no position);
+- prefers frames where the head is ≥ 60 mm from its **dwell point** (the median of its track this job;
+  the head dwells over the part it prints, the same fact behind the p25 composite) or a layer change is
+  happening, and accepts them at 15% less visibility;
+- checks the printer every 15 s between shots; when the job ends it waits for the head to park, takes a
+  **final shot** (needs 90% visible) plus the full view (`-full.jpg`), logs `JOB FINISHED` and stops;
+- prints `PRINTER ATTENTION` on paused/error (filament runout, a door open) and still shoots, so you
+  can see why. An unreachable printer is logged and monitoring continues visually.
+Endpoints (vendors' docs, 15 Oct 2026): Ultimaker `GET /api/v1/print_job`, `/api/v1/printer/heads/0/position`;
+PrusaLink `GET /api/v1/status` (digest auth; older firmware `X-Api-Key`); OctoPrint `GET /api/job`
+(`X-Api-Key`). Parsing is tested against mock servers built from those docs, **not yet against a real
+printer**: on first use run `printer-test` and check the numbers look right.
 
 **It adapts to a moved phone on its own,** conservatively. Each round compares its first 3 s with
 the saved view using a *trimmed* match error (it ignores the 40% of pixels that differ most, wherever
@@ -150,7 +180,15 @@ The first plain-mean version raised a false "moved" on the live close-up view, h
 - **The phone needs ~5 s to connect and expose** (1.5 s gave pure black with no error), so it skips
   150 frames; the Mac camera skips 45. Device indices change between calls, so devices are picked by
   name. ffmpeg's default 29.97 fps is rejected, so it forces 30/60, nv12.
-- **Stalls**: a round with no frame for 25 s gives up and retries once. A stalled ffmpeg ignores
+- **Keep-alive beats reconnecting.** Reconnecting the phone every round after minutes of idle gave
+  "no frames" rounds and dropouts (15 Oct: rounds 2, 6 and 7 of 7 lost). `timelapse` and `print monitor` now hold
+  one ffmpeg stream (`LiveStream` in cam.py): frames are deleted as they are read (disk stays flat), a
+  stream that ends or delivers nothing for 25 s is killed and reconnected after 10, 20, 40 … 300 s,
+  and the log says `stream stalled …; reconnecting`. The cap matters: on 15 Oct the iPhone dropped off
+  the camera list for ~3 h (13:07–16:10) while the Mac slept on battery (14:12–16:10). A capped
+  backoff keeps retrying every 5 min through that, so the job resumes within 5 min of the phone returning. Verified live 15 Oct (4 frames on a 30 s
+  schedule over one connection, nothing left running after) and by tests (stall, end, drain).
+- **Stalls** (with `--release`, or a single `shot`): a round with no frame for 25 s gives up and retries once. A stalled ffmpeg ignores
   SIGTERM (it once held the camera 9 min), so `ff_stop` escalates to SIGKILL, and each monitor round
   first runs `pkill -9 -f cam-shot-`. Killing `open` never stops the ffmpeg inside ClaudeCam.
 - **Blur and freezes**: autofocus hunting once produced a fully blurred "best" frame. Shots skip frames
@@ -163,6 +201,13 @@ The first plain-mean version raised a false "moved" on the live close-up view, h
 - **Locked/asleep is required** (Continuity streams only from a locked phone). Waking it after idle is
   slower on battery or in Low Power Mode, so ask for the charger. A **moved** phone is the real risk:
   ask the user to check the view through `snap`, not by picking the phone up.
+- **Regression tests**: `tests/run.sh` in the plugin package replays recorded fixtures (unmoved, bumped,
+  re-aimed, blurred, large plates), synthetic light-on-dark and rod-smear scenes, keep-alive stalls, and
+  mock Ultimaker/PrusaLink/OctoPrint servers (~3 min, no camera or printer). Run it after any change to
+  the detection or streaming code; `CAM_DIR=~/.claude/skills/camera tests/run.sh` tests the working copy.
+- **Known gap: printers whose bed drops in Z** (Ultimaker, Prusa CORE One): a tall print moves down
+  the frame as it grows, which the fixed region doesn't follow. Fine for plates and short parts; for tall
+  ones, re-run `locate` + `use` partway, or use `timelapse` with a crop.
 - `open -W` always exits 0, so success means the output file exists. Homebrew ffmpeg has no `drawtext`,
   so timestamps and grid labels are printed as text. Use `--input <image|video>` to replay recordings
   for testing without a camera (state goes under `camera-state/file/`).
